@@ -1,0 +1,166 @@
+
+
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+from torchvision import models
+import torch.nn.functional as F
+
+from ResNeXt import resnext101_32x4d
+
+nonlinearity = nn.ReLU
+
+
+def conv3x3(in_, out):
+    return nn.Conv2d(in_, out, 3, padding=1)
+
+
+class ConvRelu(nn.Module):
+    def __init__(self, in_, out):
+        super().__init__()
+        self.conv = conv3x3(in_, out)
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.activation(x)
+        return x
+
+
+class TernausXt(nn.Module):
+    def __init__(self, num_classes, num_channels=3):
+        super().__init__()
+
+        filters = [256, 512, 1024, 2048]
+        resnet = resnext101_32x4d(num_classes=1000, pretrained='imagenet')
+
+        self.stem = resnet.stem
+        self.encoder1 = resnet.layer1
+        self.encoder2 = resnet.layer2
+        self.encoder3 = resnet.layer3
+        self.encoder4 = resnet.layer4
+
+        # Decoder
+        self.decoder4 = DecoderBlockV2(filters[3], filters[3]//4, filters[2])
+        self.decoder3 = DecoderBlockV2(filters[2] + filters[2], (filters[2] + filters[2])//4, filters[1])
+        self.decoder2 = DecoderBlockV2(filters[1] + filters[1], (filters[1] + filters[1])//4, filters[0])
+        self.decoder1 = DecoderBlockV2(filters[0] + filters[0], (filters[0] + filters[0])//4, filters[0])
+
+        # Final Classifier
+        self.finaldeconv1 = nn.ConvTranspose2d(filters[0], 32, 3, stride=2)
+        self.finalrelu1 = nonlinearity(inplace=True)
+        self.finalconv2 = nn.Conv2d(32, 32, 3)
+        self.finalrelu2 = nonlinearity(inplace=True)
+        self.finalconv3 = nn.Conv2d(32, num_classes, 2, padding=1)
+
+    # noinspection PyCallingNonCallable
+    def forward(self, x):
+        # Encoder
+        x = self.stem(x)
+        # print('stem, ', x.size())
+
+        e1 = self.encoder1(x)
+        # print('e1, ', e1.size())
+
+        e2 = self.encoder2(e1)
+        # print('e2, ', e2.size())
+
+        e3 = self.encoder3(e2)
+        # print('e3, ', e3.size())
+
+        e4 = self.encoder4(e3)
+        # print('e4, ', e4.size())
+
+        # Decoder with Skip Connections
+        # change from + to cat
+        d4 = torch.cat([self.decoder4(e4), e3], 1)
+        # d4 = e3
+        d3 = torch.cat([self.decoder3(d4), e2], 1)
+        d2 = torch.cat([self.decoder2(d3), e1], 1)
+        d1 = self.decoder1(d2)
+
+        # Final Classification
+        f1 = self.finaldeconv1(d1)
+        f2 = self.finalrelu1(f1)
+        f3 = self.finalconv2(f2)
+        f4 = self.finalrelu2(f3)
+        f5 = self.finalconv3(f4)
+
+        # return f5 
+        return F.sigmoid(f5)
+    
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, n_filters):
+        super().__init__()
+
+        # B, C, H, W -> B, C/4, H, W
+        self.conv1 = nn.Conv2d(in_channels, in_channels // 4, 1)
+        self.norm1 = nn.BatchNorm2d(in_channels // 4)
+        self.relu1 = nonlinearity(inplace=True)
+
+        # B, C/4, H, W -> B, C/4, H, W
+        self.deconv2 = nn.ConvTranspose2d(in_channels // 4, in_channels // 4, 3,
+                                          stride=2, padding=1, output_padding=1)
+        self.norm2 = nn.BatchNorm2d(in_channels // 4)
+        self.relu2 = nonlinearity(inplace=True)
+
+        # B, C/4, H, W -> B, C, H, W
+        self.conv3 = nn.Conv2d(in_channels // 4, n_filters, 1)
+        self.norm3 = nn.BatchNorm2d(n_filters)
+        self.relu3 = nonlinearity(inplace=True)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.relu1(x)
+        x = self.deconv2(x)
+        x = self.norm2(x)
+        x = self.relu2(x)
+        x = self.conv3(x)
+        x = self.norm3(x)
+        x = self.relu3(x)
+        return x
+
+
+class DecoderBlockV2(nn.Module):
+    def __init__(self, in_channels, middle_channels, out_channels, is_deconv=True):
+        super(DecoderBlockV2, self).__init__()
+        self.in_channels = in_channels
+
+        if is_deconv:
+            """
+                Paramaters for Deconvolution were chosen to avoid artifacts, following
+                link https://distill.pub/2016/deconv-checkerboard/
+            """
+
+            self.block = nn.Sequential(
+                ConvRelu(in_channels, middle_channels),
+                nn.ConvTranspose2d(middle_channels, out_channels, kernel_size=4, stride=2,
+                                   padding=1),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.block = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear'),
+                ConvRelu(in_channels, out_channels)
+                # ConvRelu(middle_channels, out_channels),
+            )
+
+    def forward(self, x):
+        return self.block(x)
+
+if __name__ == '__main__':
+
+
+    input1 = torch.randn(1,3,512,512)
+    input1 = Variable(input1)
+
+    model = TernausXt(num_classes=1)
+
+
+    output1 = model(input1)
+
+    print(output1.size())
+
+
+
